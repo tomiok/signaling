@@ -19,18 +19,21 @@ var upgrader = websocket.Upgrader{
 }
 
 type Message struct {
-	Data   any    `json:"data,omitempty"`
-	Type   string `json:"type"`
-	RoomID string `json:"room_id,omitempty"`
-	PeerID string `json:"peer_id,omitempty"`
-	Target string `json:"target,omitempty"`
+	Data    any      `json:"data,omitempty"`
+	Type    string   `json:"type"`
+	RoomID  string   `json:"room_id,omitempty"`
+	PeerID  string   `json:"peer_id,omitempty"`
+	Target  string   `json:"target,omitempty"`
+	Targets []string `json:"targets,omitempty"` // Múltiples targets
 }
 
 type Client struct {
-	ID     string
-	RoomID string
-	Conn   *websocket.Conn
-	Send   chan []byte
+	ID      string
+	RoomID  string
+	Name    string // NUEVO: Almacenar nombre del usuario
+	Conn    *websocket.Conn
+	Send    chan []byte
+	HasName bool // NUEVO: Track si el cliente ya estableció su nombre
 }
 
 type Room struct {
@@ -95,11 +98,14 @@ func (h *Hub) addClientToRoom(client *Client) {
 
 	fmt.Printf("👤 Client %s joined room %s (total: %d)\n", client.ID, client.RoomID, clientCount)
 
-	// Send joined confirmation to the new client with their peer ID
+	// Send joined confirmation to the new client with their peer ID and participant count
 	joinedMsg := Message{
 		Type:   "joined",
 		PeerID: client.ID,
 		RoomID: client.RoomID,
+		Data: map[string]interface{}{
+			"participant_count": clientCount,
+		},
 	}
 	data, _ := json.Marshal(joinedMsg)
 	select {
@@ -112,11 +118,8 @@ func (h *Hub) addClientToRoom(client *Client) {
 		return
 	}
 
-	// Notify existing clients about new peer (but not the new client itself)
-	h.notifyPeerJoined(room, client.ID)
-
-	// Send existing peers to new client
-	h.sendExistingPeers(client, room)
+	// NO notificar inmediatamente - esperar a que el cliente establezca su nombre
+	fmt.Printf("🕒 Cliente %s agregado, esperando nombre antes de notificar a otros\n", client.ID)
 }
 
 func (h *Hub) removeClientFromRoom(client *Client) {
@@ -147,21 +150,72 @@ func (h *Hub) removeClientFromRoom(client *Client) {
 	}
 }
 
-func (h *Hub) notifyPeerJoined(room *Room, newPeerID string) {
+// NUEVO: Manejar cuando un cliente establece su nombre
+func (h *Hub) handleSetUserName(msg Message, sender *Client) {
+	fmt.Printf("📛 Cliente %s estableciendo nombre\n", sender.ID)
+
+	// Extraer nombre del mensaje
+	nameData, ok := msg.Data.(map[string]interface{})
+	if !ok {
+		fmt.Printf("❌ Datos de nombre inválidos de %s\n", sender.ID)
+		return
+	}
+
+	name, ok := nameData["name"].(string)
+	if !ok || name == "" {
+		fmt.Printf("❌ Nombre vacío o inválido de %s\n", sender.ID)
+		return
+	}
+
+	// Establecer nombre en el cliente
+	sender.Name = name
+	sender.HasName = true
+
+	fmt.Printf("✅ Cliente %s estableció nombre: '%s'\n", sender.ID, name)
+
+	// Obtener la sala
+	h.mutex.RLock()
+	room, exists := h.rooms[sender.RoomID]
+	h.mutex.RUnlock()
+
+	if !exists {
+		fmt.Printf("❌ Sala %s no encontrada\n", sender.RoomID)
+		return
+	}
+
+	// Notificar a todos los clientes existentes (con nombre establecido) sobre el nuevo peer
+	h.notifyPeerJoinedWithName(room, sender.ID)
+
+	// Enviar peers existientes al nuevo cliente
+	h.sendExistingPeersWithNames(sender, room)
+
+	// Broadcast del nombre establecido a todos los demás
+	h.broadcastUserNameSet(room, sender.ID, name)
+}
+
+// NUEVO: Notificar peer_joined solo a clientes que ya tienen nombre
+func (h *Hub) notifyPeerJoinedWithName(room *Room, newPeerID string) {
+	room.mutex.RLock()
+	participantCount := len(room.Clients)
+	room.mutex.RUnlock()
+
 	message := Message{
 		Type:   "peer_joined",
 		PeerID: newPeerID,
 		RoomID: room.ID,
+		Data: map[string]interface{}{
+			"participant_count": participantCount,
+		},
 	}
 
 	data, _ := json.Marshal(message)
-	fmt.Printf("📣 Notifying existing clients about new peer: %s\n", newPeerID)
+	fmt.Printf("📣 Notificando clientes existentes sobre nuevo peer: %s (total: %d)\n", newPeerID, participantCount)
 
 	room.mutex.RLock()
 	for clientID, client := range room.Clients {
-		// Don't notify the new peer about themselves
-		if clientID != newPeerID {
-			fmt.Printf("  └─ Sending peer_joined to: %s\n", clientID)
+		// Solo notificar a clientes que ya tienen nombre establecido y no son el nuevo peer
+		if clientID != newPeerID && client.HasName {
+			fmt.Printf("  └─ Enviando peer_joined a: %s\n", clientID)
 			select {
 			case client.Send <- data:
 			default:
@@ -173,15 +227,50 @@ func (h *Hub) notifyPeerJoined(room *Room, newPeerID string) {
 	room.mutex.RUnlock()
 }
 
+// NUEVO: Broadcast cuando un usuario establece su nombre
+func (h *Hub) broadcastUserNameSet(room *Room, peerId, name string) {
+	message := Message{
+		Type: "user_name_set",
+		Data: map[string]interface{}{
+			"peerId": peerId,
+			"name":   name,
+		},
+	}
+
+	data, _ := json.Marshal(message)
+	fmt.Printf("📛 Broadcasting nombre establecido: %s -> %s\n", peerId, name)
+
+	room.mutex.RLock()
+	for clientID, client := range room.Clients {
+		if clientID != peerId && client.HasName {
+			select {
+			case client.Send <- data:
+				fmt.Printf("  └─ Enviado user_name_set a: %s\n", clientID)
+			default:
+				close(client.Send)
+				delete(room.Clients, clientID)
+			}
+		}
+	}
+	room.mutex.RUnlock()
+}
+
 func (h *Hub) notifyPeerLeft(room *Room, leftPeerID string) {
+	room.mutex.RLock()
+	participantCount := len(room.Clients)
+	room.mutex.RUnlock()
+
 	message := Message{
 		Type:   "peer_left",
 		PeerID: leftPeerID,
 		RoomID: room.ID,
+		Data: map[string]interface{}{
+			"participant_count": participantCount,
+		},
 	}
 
 	data, _ := json.Marshal(message)
-	fmt.Printf("📣 Notifying clients about peer leaving: %s\n", leftPeerID)
+	fmt.Printf("📣 Notifying clients about peer leaving: %s (remaining: %d)\n", leftPeerID, participantCount)
 
 	room.mutex.RLock()
 	for clientID, client := range room.Clients {
@@ -195,17 +284,20 @@ func (h *Hub) notifyPeerLeft(room *Room, leftPeerID string) {
 	room.mutex.RUnlock()
 }
 
-func (h *Hub) sendExistingPeers(newClient *Client, room *Room) {
+// MODIFICADO: Solo enviar peers que ya tienen nombres establecidos
+func (h *Hub) sendExistingPeersWithNames(newClient *Client, room *Room) {
 	room.mutex.RLock()
 	existingPeers := make([]string, 0)
-	for clientID := range room.Clients {
-		if clientID != newClient.ID {
+	participantCount := len(room.Clients)
+	for clientID, client := range room.Clients {
+		// Solo incluir peers que ya tienen nombre establecido
+		if clientID != newClient.ID && client.HasName {
 			existingPeers = append(existingPeers, clientID)
 		}
 	}
 	room.mutex.RUnlock()
 
-	fmt.Printf("📋 Sending existing peers to new client %s: %v\n", newClient.ID, existingPeers)
+	fmt.Printf("📋 Enviando peers existentes (con nombres) a %s: %v (total: %d)\n", newClient.ID, existingPeers, participantCount)
 
 	// Send each existing peer as a separate peer_joined message
 	for _, peerID := range existingPeers {
@@ -213,11 +305,14 @@ func (h *Hub) sendExistingPeers(newClient *Client, room *Room) {
 			Type:   "peer_joined",
 			PeerID: peerID,
 			RoomID: room.ID,
+			Data: map[string]interface{}{
+				"participant_count": participantCount,
+			},
 		}
 		data, _ := json.Marshal(message)
 		select {
 		case newClient.Send <- data:
-			fmt.Printf("  └─ Sent existing peer %s to new client %s\n", peerID, newClient.ID)
+			fmt.Printf("  └─ Enviado peer existente %s a nuevo cliente %s\n", peerID, newClient.ID)
 		default:
 			close(newClient.Send)
 			room.mutex.Lock()
@@ -225,6 +320,40 @@ func (h *Hub) sendExistingPeers(newClient *Client, room *Room) {
 			room.mutex.Unlock()
 			return
 		}
+	}
+}
+
+func (h *Hub) handleConnectionFailed(msg Message, sender *Client) {
+	fmt.Printf("🚨 Connection failed reported by %s for peer %s\n", sender.ID, msg.Target)
+
+	h.mutex.RLock()
+	room, exists := h.rooms[sender.RoomID]
+	h.mutex.RUnlock()
+
+	if !exists {
+		fmt.Printf("❌ Room %s not found for connection failure report\n", sender.RoomID)
+		return
+	}
+
+	room.mutex.Lock()
+	// Check if the target peer actually exists and remove them if they do
+	if targetClient, exists := room.Clients[msg.Target]; exists {
+		fmt.Printf("🗑️ Removing failed peer %s from room %s\n", msg.Target, sender.RoomID)
+
+		// Close the failed client's connection
+		close(targetClient.Send)
+		delete(room.Clients, msg.Target)
+
+		participantCount := len(room.Clients)
+		room.mutex.Unlock()
+
+		// Notify all remaining clients about the peer removal
+		h.notifyPeerLeft(room, msg.Target)
+
+		fmt.Printf("📊 Room %s now has %d participants after removing failed peer\n", sender.RoomID, participantCount)
+	} else {
+		room.mutex.Unlock()
+		fmt.Printf("⚠️ Failed peer %s was not found in room %s\n", msg.Target, sender.RoomID)
 	}
 }
 
@@ -246,8 +375,31 @@ func (h *Hub) forwardMessage(msg Message, sender *Client) {
 	room.mutex.RLock()
 	defer room.mutex.RUnlock()
 
+	// Handle multiple specific targets
+	if len(msg.Targets) > 0 {
+		fmt.Printf("📤 Forwarding %s from %s to multiple targets: %v\n", msg.Type, sender.ID, msg.Targets)
+		sentCount := 0
+		for _, targetID := range msg.Targets {
+			if targetClient, exists := room.Clients[targetID]; exists {
+				select {
+				case targetClient.Send <- data:
+					sentCount++
+					fmt.Printf("  ✅ Delivered to %s\n", targetID)
+				default:
+					close(targetClient.Send)
+					delete(room.Clients, targetID)
+					fmt.Printf("  ❌ Failed to deliver to %s (client disconnected)\n", targetID)
+				}
+			} else {
+				fmt.Printf("  ❌ Target client %s not found\n", targetID)
+			}
+		}
+		fmt.Printf("  📊 Successfully delivered to %d/%d targets\n", sentCount, len(msg.Targets))
+		return
+	}
+
+	// Handle single specific target (existing behavior)
 	if msg.Target != "" {
-		// Send to specific peer
 		fmt.Printf("📤 Forwarding %s from %s to %s\n", msg.Type, sender.ID, msg.Target)
 		if targetClient, exists := room.Clients[msg.Target]; exists {
 			select {
@@ -261,22 +413,28 @@ func (h *Hub) forwardMessage(msg Message, sender *Client) {
 		} else {
 			fmt.Printf("  ❌ Target client %s not found\n", msg.Target)
 		}
-	} else {
-		// Broadcast to all except sender
-		fmt.Printf("📢 Broadcasting %s from %s to all peers\n", msg.Type, sender.ID)
-		for clientID, client := range room.Clients {
-			if clientID != sender.ID {
-				select {
-				case client.Send <- data:
-					fmt.Printf("  ✅ Broadcasted to %s\n", clientID)
-				default:
-					close(client.Send)
-					delete(room.Clients, clientID)
-					fmt.Printf("  ❌ Failed to broadcast to %s (client disconnected)\n", clientID)
-				}
+		return
+	}
+
+	// No target specified = broadcast to all except sender
+	fmt.Printf("📢 Broadcasting %s from %s to all peers\n", msg.Type, sender.ID)
+	sentCount := 0
+	totalClients := len(room.Clients) - 1 // Exclude sender
+
+	for clientID, client := range room.Clients {
+		if clientID != sender.ID {
+			select {
+			case client.Send <- data:
+				sentCount++
+				fmt.Printf("  ✅ Broadcasted to %s\n", clientID)
+			default:
+				close(client.Send)
+				delete(room.Clients, clientID)
+				fmt.Printf("  ❌ Failed to broadcast to %s (client disconnected)\n", clientID)
 			}
 		}
 	}
+	fmt.Printf("  📊 Successfully broadcasted to %d/%d clients\n", sentCount, totalClients)
 }
 
 // Generate a unique peer ID
@@ -307,10 +465,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientID := generatePeerID()
 
 	client := &Client{
-		ID:     clientID,
-		RoomID: roomID,
-		Conn:   conn,
-		Send:   make(chan []byte, 256),
+		ID:      clientID,
+		RoomID:  roomID,
+		Name:    "", // Inicialmente vacío
+		Conn:    conn,
+		Send:    make(chan []byte, 256),
+		HasName: false, // Inicialmente false
 	}
 
 	fmt.Printf("🔗 New WebSocket connection: %s joining room %s\n", clientID, roomID)
@@ -345,8 +505,19 @@ func (c *Client) readPump(hub *Hub) {
 			continue
 		}
 
-		// The peer ID will be set in forwardMessage
 		fmt.Printf("📨 Received from %s: %s (target: %s)\n", c.ID, msg.Type, msg.Target)
+
+		// NUEVO: Manejar establecimiento de nombre
+		if msg.Type == "set_user_name" {
+			hub.handleSetUserName(msg, c)
+			continue
+		}
+
+		// NUEVO: Manejar fallo de conexión
+		if msg.Type == "connection_failed" {
+			hub.handleConnectionFailed(msg, c)
+			continue
+		}
 
 		// Forward message to appropriate peers
 		hub.forwardMessage(msg, c)
@@ -405,17 +576,26 @@ func main() {
 		defer hub.mutex.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
+		type ClientInfo struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			HasName bool   `json:"has_name"`
+		}
 		type RoomInfo struct {
-			ID      string   `json:"id"`
-			Clients []string `json:"clients"`
+			ID      string       `json:"id"`
+			Clients []ClientInfo `json:"clients"`
 		}
 
 		var rooms []RoomInfo
 		for roomID, room := range hub.rooms {
 			room.mutex.RLock()
-			clients := make([]string, 0, len(room.Clients))
-			for clientID := range room.Clients {
-				clients = append(clients, clientID)
+			clients := make([]ClientInfo, 0, len(room.Clients))
+			for clientID, client := range room.Clients {
+				clients = append(clients, ClientInfo{
+					ID:      clientID,
+					Name:    client.Name,
+					HasName: client.HasName,
+				})
 			}
 			room.mutex.RUnlock()
 
